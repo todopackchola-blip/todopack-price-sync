@@ -1,4 +1,8 @@
 const BSALE = "https://api.bsale.io";
+const SHOPIFY_API_VERSION = "2026-01";
+
+let cachedShopifyToken = null;
+let cachedShopifyTokenExpiresAt = 0;
 
 async function bsaleGet(path) {
   const token = process.env.BSALE_ACCESS_TOKEN;
@@ -58,17 +62,65 @@ async function bsalePrice(sku) {
   throw new Error(`SKU ${sku} no encontrado en Bsale`);
 }
 
-async function shopify(query, variables) {
+function shopifyDomain() {
   const domain = process.env.SHOPIFY_STORE_DOMAIN;
-  const token =
+  if (!domain) throw new Error("Falta SHOPIFY_STORE_DOMAIN");
+  return domain;
+}
+
+async function getShopifyAccessToken() {
+  const staticToken =
     process.env.SHOPIFY_ADMIN_ACCESS_TOKEN ||
     process.env.SHOPIFY_ACCESS_TOKEN;
 
-  if (!domain || !token) {
-    throw new Error("Faltan credenciales de Shopify");
+  if (staticToken) return staticToken;
+
+  const clientId = process.env.SHOPIFY_CLIENT_ID;
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+  const domain = shopifyDomain();
+
+  if (!clientId || !clientSecret) {
+    throw new Error("Faltan SHOPIFY_CLIENT_ID o SHOPIFY_CLIENT_SECRET");
   }
 
-  const r = await fetch(`https://${domain}/admin/api/2026-01/graphql.json`, {
+  const now = Date.now();
+  if (cachedShopifyToken && now < cachedShopifyTokenExpiresAt) {
+    return cachedShopifyToken;
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret
+  });
+
+  const r = await fetch(`https://${domain}/admin/oauth/access_token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body
+  });
+
+  const data = await r.json();
+
+  if (!r.ok || !data.access_token) {
+    throw new Error(`Shopify auth ${r.status}: ${JSON.stringify(data)}`);
+  }
+
+  cachedShopifyToken = data.access_token;
+  const expiresIn = Number(data.expires_in || 86399);
+  cachedShopifyTokenExpiresAt = now + Math.max(60, expiresIn - 300) * 1000;
+
+  return cachedShopifyToken;
+}
+
+async function shopify(query, variables = {}) {
+  const domain = shopifyDomain();
+  const token = await getShopifyAccessToken();
+
+  const r = await fetch(`https://${domain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -109,14 +161,22 @@ export default async function handler(req, res) {
     }
 
     if (route === "health") {
+      const hasStaticShopifyToken = !!(
+        process.env.SHOPIFY_ADMIN_ACCESS_TOKEN ||
+        process.env.SHOPIFY_ACCESS_TOKEN
+      );
+
+      const hasShopifyClientCredentials = !!(
+        process.env.SHOPIFY_CLIENT_ID &&
+        process.env.SHOPIFY_CLIENT_SECRET
+      );
+
       return res.status(200).json({
         ok: true,
         bsaleToken: !!process.env.BSALE_ACCESS_TOKEN,
         bsalePriceList: !!process.env.BSALE_PRICE_LIST_ID,
-        shopify: !!(
-          process.env.SHOPIFY_STORE_DOMAIN &&
-          (process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ACCESS_TOKEN)
-        ),
+        shopifyDomain: !!process.env.SHOPIFY_STORE_DOMAIN,
+        shopifyAuth: hasStaticShopifyToken || hasShopifyClientCredentials,
         dryRun: process.env.DRY_RUN !== "false"
       });
     }
@@ -158,6 +218,39 @@ export default async function handler(req, res) {
       }
 
       return res.status(200).json({ ok: true, results });
+    }
+
+    if (route === "test-shopify") {
+      const data = await shopify(`
+        query TodoPackShopifyReadOnlyTest {
+          shop {
+            name
+            primaryDomain {
+              host
+              url
+            }
+          }
+          products(first: 3) {
+            nodes {
+              id
+              title
+              variants(first: 5) {
+                nodes {
+                  id
+                  sku
+                  price
+                }
+              }
+            }
+          }
+        }
+      `);
+
+      return res.status(200).json({
+        ok: true,
+        shop: data.data?.shop || null,
+        products: data.data?.products?.nodes || []
+      });
     }
 
     return res.status(404).json({
