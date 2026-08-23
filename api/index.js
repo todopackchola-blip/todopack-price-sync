@@ -3,6 +3,7 @@ const SHOPIFY_API_VERSION = "2026-01";
 
 let cachedShopifyToken = null;
 let cachedShopifyTokenExpiresAt = 0;
+let cachedShopifyScope = null;
 
 async function bsaleGet(path) {
   const token = process.env.BSALE_ACCESS_TOKEN;
@@ -73,7 +74,10 @@ async function getShopifyAccessToken() {
     process.env.SHOPIFY_ADMIN_ACCESS_TOKEN ||
     process.env.SHOPIFY_ACCESS_TOKEN;
 
-  if (staticToken) return staticToken;
+  if (staticToken) {
+    cachedShopifyScope = null;
+    return staticToken;
+  }
 
   const clientId = process.env.SHOPIFY_CLIENT_ID;
   const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
@@ -110,6 +114,7 @@ async function getShopifyAccessToken() {
   }
 
   cachedShopifyToken = data.access_token;
+  cachedShopifyScope = data.scope || "";
   const expiresIn = Number(data.expires_in || 86399);
   cachedShopifyTokenExpiresAt = now + Math.max(60, expiresIn - 300) * 1000;
 
@@ -218,6 +223,19 @@ export default async function handler(req, res) {
       }
 
       return res.status(200).json({ ok: true, results });
+    }
+
+    if (route === "shopify-scopes") {
+      cachedShopifyToken = null;
+      cachedShopifyTokenExpiresAt = 0;
+      cachedShopifyScope = null;
+
+      await getShopifyAccessToken();
+
+      return res.status(200).json({
+        ok: true,
+        scope: cachedShopifyScope
+      });
     }
 
     if (route === "test-shopify") {
