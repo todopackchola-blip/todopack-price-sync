@@ -143,6 +143,45 @@ async function shopify(query, variables = {}) {
   return data;
 }
 
+async function shopifyVariantBySku(sku) {
+  const data = await shopify(
+    `query TodoPackVariantBySku($query: String!) {
+      productVariants(first: 10, query: $query) {
+        nodes {
+          id
+          sku
+          price
+          product {
+            id
+            title
+          }
+        }
+      }
+    }`,
+    { query: `sku:${sku}` }
+  );
+
+  const variants = data.data?.productVariants?.nodes || [];
+  const exact = variants.find(v => String(v.sku) === String(sku));
+
+  if (!exact) {
+    throw new Error(`SKU ${sku} no encontrado en Shopify`);
+  }
+
+  const price = Number(exact.price);
+  if (!Number.isFinite(price)) {
+    throw new Error(`Precio Shopify invalido para ${sku}`);
+  }
+
+  return {
+    sku: exact.sku,
+    price,
+    variantId: exact.id,
+    productId: exact.product?.id || null,
+    productName: exact.product?.title || ""
+  };
+}
+
 export default async function handler(req, res) {
   try {
     const url = new URL(req.url, "https://example.com");
@@ -268,6 +307,59 @@ export default async function handler(req, res) {
         ok: true,
         shop: data.data?.shop || null,
         products: data.data?.products?.nodes || []
+      });
+    }
+
+    if (route === "compare-prices") {
+      const skus = (url.searchParams.get("skus") || "")
+        .split(",")
+        .map(x => x.trim())
+        .filter(Boolean);
+
+      if (!skus.length) {
+        return res.status(400).json({
+          ok: false,
+          error: "Falta parametro skus"
+        });
+      }
+
+      const results = [];
+
+      for (const sku of skus) {
+        try {
+          const [bsale, shopifyVariant] = await Promise.all([
+            bsalePrice(sku),
+            shopifyVariantBySku(sku)
+          ]);
+
+          const targetPrice = Number(bsale.shopifyPrice);
+          const currentPrice = Number(shopifyVariant.price);
+
+          results.push({
+            ok: true,
+            sku,
+            productName: shopifyVariant.productName || bsale.productName,
+            bsalePriceRaw: bsale.bsalePriceRaw,
+            targetShopifyPrice: targetPrice,
+            currentShopifyPrice: currentPrice,
+            difference: targetPrice - currentPrice,
+            matches: targetPrice === currentPrice,
+            wouldUpdate: targetPrice !== currentPrice
+          });
+        } catch (e) {
+          results.push({
+            ok: false,
+            sku,
+            error: e.message
+          });
+        }
+      }
+
+      return res.status(200).json({
+        ok: true,
+        mode: "read-only-comparison",
+        writesPerformed: false,
+        results
       });
     }
 
