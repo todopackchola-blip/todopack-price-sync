@@ -121,6 +121,19 @@ export default async function handler(req, res) {
       });
     }
 
+    if (route === "price-lists") {
+      const data = await bsaleGet("/v1/price_lists.json?limit=50");
+      const lists = (data.items || data.data || []).map(item => ({
+        id: item.id,
+        name: item.name
+      }));
+
+      return res.status(200).json({
+        ok: true,
+        lists
+      });
+    }
+
     if (route === "test-bsale") {
       const skus = (process.env.TEST_SKUS || "")
         .split(",")
