@@ -66,15 +66,24 @@ async function bsalePriceBySku(sku) {
   const exact = items.find(item => String(item?.variant?.code || "") === String(sku)) || items[0];
   if (!exact) throw new Error(`SKU ${sku} no encontrado en la lista de precios Bsale`);
 
-  const raw = Number(exact.variantValue);
-  if (!Number.isFinite(raw)) throw new Error(`Precio Bsale invalido para ${sku}`);
+  const net = Number(exact.variantValue);
+  const withTaxes = Number(exact.variantValueWithTaxes);
+
+  if (!Number.isFinite(net) || !Number.isFinite(withTaxes)) {
+    throw new Error(`Precio Bsale invalido para ${sku}`);
+  }
+
+  const safetyBlocked = withTaxes <= 0;
 
   return {
     sku,
     bsaleVariantId: exact?.variant?.id || null,
     bsaleVariantCode: exact?.variant?.code || null,
-    bsalePriceRaw: raw,
-    targetShopifyPrice: Math.ceil(raw)
+    bsalePriceNet: net,
+    bsalePriceWithTaxes: withTaxes,
+    targetShopifyPrice: safetyBlocked ? null : Math.ceil(withTaxes),
+    safetyBlocked,
+    safetyReason: safetyBlocked ? "Precio Bsale con impuestos es 0 o negativo" : null
   };
 }
 
@@ -168,16 +177,22 @@ export default async function handler(req, res) {
         try {
           const bsale = await bsalePriceBySku(sku);
           const currentShopifyPrice = Number(variant.price);
+          const matches = !bsale.safetyBlocked && currentShopifyPrice === bsale.targetShopifyPrice;
+          const wouldUpdate = !bsale.safetyBlocked && currentShopifyPrice !== bsale.targetShopifyPrice;
+
           comparisons.push({
             ok: true,
             productName: product.title,
             sku,
             currentShopifyPrice,
-            bsalePriceRaw: bsale.bsalePriceRaw,
+            bsalePriceNet: bsale.bsalePriceNet,
+            bsalePriceWithTaxes: bsale.bsalePriceWithTaxes,
             targetShopifyPrice: bsale.targetShopifyPrice,
-            matches: currentShopifyPrice === bsale.targetShopifyPrice,
-            difference: bsale.targetShopifyPrice - currentShopifyPrice,
-            wouldUpdate: currentShopifyPrice !== bsale.targetShopifyPrice,
+            matches,
+            difference: bsale.safetyBlocked ? null : bsale.targetShopifyPrice - currentShopifyPrice,
+            wouldUpdate,
+            safetyBlocked: bsale.safetyBlocked,
+            safetyReason: bsale.safetyReason,
             bsaleVariantId: bsale.bsaleVariantId,
             bsaleVariantCode: bsale.bsaleVariantCode
           });
@@ -197,11 +212,15 @@ export default async function handler(req, res) {
       ok: true,
       mode: "read-only-audit",
       writesPerformed: false,
+      priceSource: "Bsale variantValueWithTaxes",
+      roundingRule: "Math.ceil / redondeo hacia arriba",
+      zeroOrNegativePricePolicy: "BLOCK",
       validatedProductsFound: validatedProducts.length,
       validatedProductTitles: validatedProducts.map(p => p.title),
       comparisonCount: comparisons.length,
       matchedCount: comparisons.filter(x => x.ok && x.matches).length,
-      differingCount: comparisons.filter(x => x.ok && !x.matches).length,
+      differingCount: comparisons.filter(x => x.ok && x.wouldUpdate).length,
+      blockedCount: comparisons.filter(x => x.ok && x.safetyBlocked).length,
       errorCount: comparisons.filter(x => !x.ok).length,
       comparisons
     });
