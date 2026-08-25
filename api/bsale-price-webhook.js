@@ -27,11 +27,8 @@ const BSALE_VARIANT_TO_SKU = new Map([
   [7057, "TNT-40X50-NG"]
 ]);
 
-// Excepciones temporales: el usuario las revisara manualmente antes de automatizarlas.
-const MANUAL_REVIEW_SKUS = new Set([
-  "PP-12X20",
-  "PAP-1-2K-B"
-]);
+// Sin excepciones manuales vigentes: los SKU revisados fueron aprobados para automatizacion.
+const MANUAL_REVIEW_SKUS = new Set();
 
 function jsonBody(req) {
   if (!req.body) return {};
