@@ -8,6 +8,10 @@ const BSALE_VARIANT_TO_SKU = new Map([
   [5907, "PP-10X15"],
   [5930, "PP-12X20"],
   [5960, "PP-15X25"],
+  [5986, "PP-20X30"],
+  [6006, "PP-25X35"],
+  [6029, "PP-30X40"],
+  [6075, "PP-45X50"],
   [7059, "ZIP-2.5X2.5"],
   [7027, "ZIP-3X4"],
   [6998, "ZIP-4X6"],
@@ -27,6 +31,21 @@ const BSALE_VARIANT_TO_SKU = new Map([
   [7057, "TNT-40X50-NG"]
 ]);
 
+const PP_SKUS = new Set([
+  "PP-5X10",
+  "PP-10X15",
+  "PP-10X20",
+  "PP-12X20",
+  "PP-15X25",
+  "PP-20X30",
+  "PP-25X35",
+  "PP-30X40",
+  "PP-45X50"
+]);
+
+const PP_QUANTITY_INCREMENT = 100;
+const DEFAULT_PP_MINIMUM_ORDER_VALUE_CLP = 9000;
+
 // Sin excepciones manuales vigentes: los SKU revisados fueron aprobados para automatizacion.
 const MANUAL_REVIEW_SKUS = new Set();
 
@@ -38,6 +57,36 @@ function jsonBody(req) {
   } catch {
     return {};
   }
+}
+
+function ppMinimumOrderValueClp() {
+  const value = Number(
+    process.env.PP_MINIMUM_ORDER_VALUE_CLP || DEFAULT_PP_MINIMUM_ORDER_VALUE_CLP
+  );
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("PP_MINIMUM_ORDER_VALUE_CLP invalido");
+  }
+
+  return value;
+}
+
+function calculatePpMinimumQuantity(shopifyPrice) {
+  if (!Number.isFinite(shopifyPrice) || shopifyPrice <= 0) {
+    throw new Error("Precio Shopify invalido para calcular minimo PP");
+  }
+
+  const minimumOrderValue = ppMinimumOrderValueClp();
+  return Math.max(
+    PP_QUANTITY_INCREMENT,
+    Math.ceil(minimumOrderValue / (shopifyPrice * PP_QUANTITY_INCREMENT)) *
+      PP_QUANTITY_INCREMENT
+  );
+}
+
+function parsePositiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 async function bsaleGet(path) {
@@ -137,6 +186,14 @@ async function shopifyVariantBySku(sku) {
           id
           sku
           price
+          minimumQuantity: metafield(namespace: "custom", key: "minimum_quantity") {
+            value
+            type
+          }
+          quantityIncrement: metafield(namespace: "custom", key: "quantity_increment") {
+            value
+            type
+          }
           product { id title }
         }
       }
@@ -152,21 +209,59 @@ async function shopifyVariantBySku(sku) {
     variantId: exact.id,
     productId: exact.product?.id,
     productName: exact.product?.title || "",
-    currentPrice: Number(exact.price)
+    currentPrice: Number(exact.price),
+    currentMinimumQuantity: parsePositiveInteger(exact.minimumQuantity?.value),
+    currentQuantityIncrement: parsePositiveInteger(exact.quantityIncrement?.value)
   };
 }
 
-async function updateShopifyVariantPrice(productId, variantId, price) {
+async function updateShopifyVariant({
+  productId,
+  variantId,
+  targetPrice,
+  targetMinimumQuantity,
+  priceChanged,
+  minimumChanged
+}) {
+  const variantInput = { id: variantId };
+
+  if (priceChanged) {
+    variantInput.price = String(targetPrice);
+  }
+
+  if (minimumChanged) {
+    variantInput.metafields = [
+      {
+        namespace: "custom",
+        key: "minimum_quantity",
+        type: "number_integer",
+        value: String(targetMinimumQuantity)
+      }
+    ];
+  }
+
   const data = await shopify(
-    `mutation TodoPackUpdateVariantPrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants { id sku price }
+    `mutation TodoPackUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+      productVariantsBulkUpdate(
+        productId: $productId
+        variants: $variants
+        allowPartialUpdates: false
+      ) {
+        productVariants {
+          id
+          sku
+          price
+          minimumQuantity: metafield(namespace: "custom", key: "minimum_quantity") {
+            value
+            type
+          }
+        }
         userErrors { field message }
       }
     }`,
     {
       productId,
-      variants: [{ id: variantId, price: String(price) }]
+      variants: [variantInput]
     }
   );
 
@@ -239,7 +334,15 @@ export default async function handler(req, res) {
       });
     }
 
-    if (shopifyVariant.currentPrice === bsale.targetShopifyPrice) {
+    const isPp = PP_SKUS.has(sku);
+    const targetMinimumQuantity = isPp
+      ? calculatePpMinimumQuantity(bsale.targetShopifyPrice)
+      : null;
+    const priceChanged = shopifyVariant.currentPrice !== bsale.targetShopifyPrice;
+    const minimumChanged = isPp &&
+      shopifyVariant.currentMinimumQuantity !== targetMinimumQuantity;
+
+    if (!priceChanged && !minimumChanged) {
       return res.status(200).json({
         ok: true,
         updated: false,
@@ -248,25 +351,39 @@ export default async function handler(req, res) {
         productName: shopifyVariant.productName,
         shopifyPrice: shopifyVariant.currentPrice,
         bsalePriceWithTaxes: bsale.bsalePriceWithTaxes,
-        targetShopifyPrice: bsale.targetShopifyPrice
+        targetShopifyPrice: bsale.targetShopifyPrice,
+        minimumQuantity: shopifyVariant.currentMinimumQuantity,
+        quantityIncrement: shopifyVariant.currentQuantityIncrement,
+        minimumOrderValueCLP: isPp ? ppMinimumOrderValueClp() : null
       });
     }
 
-    const updated = await updateShopifyVariantPrice(
-      shopifyVariant.productId,
-      shopifyVariant.variantId,
-      bsale.targetShopifyPrice
-    );
+    const updated = await updateShopifyVariant({
+      productId: shopifyVariant.productId,
+      variantId: shopifyVariant.variantId,
+      targetPrice: bsale.targetShopifyPrice,
+      targetMinimumQuantity,
+      priceChanged,
+      minimumChanged
+    });
 
     return res.status(200).json({
       ok: true,
       updated: true,
       sku,
       productName: shopifyVariant.productName,
+      priceChanged,
       previousShopifyPrice: shopifyVariant.currentPrice,
       bsalePriceWithTaxes: bsale.bsalePriceWithTaxes,
       newShopifyPrice: Number(updated?.price ?? bsale.targetShopifyPrice),
-      roundingRule: "Math.ceil"
+      roundingRule: "Math.ceil",
+      minimumChanged,
+      previousMinimumQuantity: shopifyVariant.currentMinimumQuantity,
+      newMinimumQuantity: isPp
+        ? parsePositiveInteger(updated?.minimumQuantity?.value) ?? targetMinimumQuantity
+        : null,
+      quantityIncrement: shopifyVariant.currentQuantityIncrement,
+      minimumOrderValueCLP: isPp ? ppMinimumOrderValueClp() : null
     });
   } catch (e) {
     return res.status(500).json({ ok: false, updated: false, error: e.message });
